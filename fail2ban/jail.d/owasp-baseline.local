@@ -1,0 +1,76 @@
+# OWASP-aligned-ish baseline (brute-force & common web auth protections)
+# for Fail2ban on Debian/Ubuntu.
+#
+# Goal: easy install like previous setup by dropping into jail.d.
+#
+# Install:
+#   sudo install -d /etc/fail2ban/jail.d
+#   sudo install -m 0644 fail2ban/jail.d/owasp-baseline.local /etc/fail2ban/jail.d/owasp-baseline.local
+#   sudo systemctl restart fail2ban
+#   sudo fail2ban-client status
+#
+# Notes:
+# - Assumes Debian/Ubuntu log paths (auth.log, nginx/apache logs via paths-debian.conf).
+# - Adjust ignoreip, bantime, maxretry, and enabled jails to your environment.
+
+[DEFAULT]
+# Never ban yourself / internal networks (add your office/VPN CIDRs here)
+ignoreip = 127.0.0.1/8 ::1
+
+# Conservative but effective defaults
+findtime = 10m
+maxretry = 5
+bantime  = 1d
+
+# Prefer systemd backend when available; fall back to auto.
+backend = auto
+
+# Use iptables (legacy) by default; if you use nftables, switch accordingly.
+banaction = iptables-multiport
+
+# Helpful incremental bans for repeat offenders (uncomment to enable)
+#bantime.increment = true
+#bantime.maxtime = 1w
+
+# --- SSH ---
+[sshd]
+enabled = true
+port = ssh
+
+# --- Web servers ---
+# Nginx: protect HTTP basic auth endpoints
+[nginx-http-auth]
+enabled = true
+port = http,https
+
+# Nginx: common botsearch patterns (404 scanning etc.)
+[nginx-botsearch]
+enabled = true
+port = http,https
+maxretry = 2
+
+# Apache: auth failures
+[apache-auth]
+enabled = true
+port = http,https
+
+# Apache: botsearch
+[apache-botsearch]
+enabled = true
+port = http,https
+maxretry = 2
+
+# If you run ModSecurity with audit/error logs:
+[apache-modsecurity]
+enabled = true
+port = http,https
+maxretry = 2
+
+# --- Recidive: longer bans for repeat offenders across jails ---
+# Needs fail2ban.log; ensure it's enabled.
+[recidive]
+enabled = true
+banaction = iptables-allports
+findtime = 1d
+bantime = 1w
+maxretry = 5
