@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
 # Colors
 GRN='\033[32m'
@@ -7,128 +8,261 @@ RED='\033[31m'
 CYN='\033[36m'
 RST='\033[0m'
 
-FIREWALL_INSTALL (){
-        echo -e "${GRN}[*] Installing firewall (fail2ban) for secure logins.${RST}"
-        sudo apt install fail2ban iptables -y 2> /dev/null
-        sudo cp -i fail2ban/jail.local /etc/fail2ban/
-        echo -e "${GRN}[*] Starting fail2ban and enabling.\n"
-        sudo systemctl start fail2ban && sudo systemctl enable fail2ban
-                
-        if [[ $? == 0 ]];
-        then
-                echo -e "\n${GRN}[*] Installed and started fail2ban successfully.${RST}"
-                echo -e "${GRN}[*] By default fail2ban will only ban ip that does more than 3 wrong attempts for ssh. It will be baned for 1 day.${CYN}\n"
-                sudo fail2ban-client status sshd
-        else
-                echo -e "${RED}[!] Failed to install or start to fail2ban.${RST}\n"
-        fi
+log()  { echo -e "${GRN}[*] $*${RST}"; }
+warn() { echo -e "${YLO}[!] $*${RST}"; }
+err()  { echo -e "${RED}[!] $*${RST}"; }
+
+need_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    err "Please run as root (or via sudo)."
+    exit 1
+  fi
 }
 
-while :
-do	
-	echo -e "${RED}[!] Caution this should not be run on actual production server or your main computer.${RST}\n"
+detect_distro() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID=${ID:-unknown}
+    OS_LIKE=${ID_LIKE:-}
+  else
+    OS_ID=unknown
+    OS_LIKE=
+  fi
 
-	echo -e "${GRN}[*]1. Apache2"
-	echo -e "[*]2. Nginx"
-	echo -e -n "[*] Which server you want to install: ${RST}"
-	read SERVER
+  # Determine family
+  if [[ "$OS_ID" =~ (debian|ubuntu|linuxmint|raspbian) ]] || [[ "$OS_LIKE" =~ (debian|ubuntu) ]]; then
+    DISTRO_FAMILY=debian
+    PKG_MGR=apt
+  elif [[ "$OS_ID" =~ (fedora|rhel|centos|rocky|almalinux) ]] || [[ "$OS_LIKE" =~ (rhel|fedora|centos) ]]; then
+    DISTRO_FAMILY=fedora
+    PKG_MGR=dnf
+    command -v dnf >/dev/null 2>&1 || PKG_MGR=yum
+  elif [[ "$OS_ID" =~ (arch|manjaro|endeavouros) ]] || [[ "$OS_LIKE" =~ arch ]]; then
+    DISTRO_FAMILY=arch
+    PKG_MGR=pacman
+  else
+    DISTRO_FAMILY=unknown
+    PKG_MGR=
+  fi
+}
 
-	if [[ ${SERVER} == 1 ]];
-	then
-		echo -e "\n${GRN}[*] Updating system & installing apache2, libapache2-mod-security${RST}"
-		sudo apt update > /dev/null 2>&1
-		sudo apt install apache2 apache2-utils libapache2-mod-security2 -y 2> /dev/null
-		echo -e "${GRN}[*] Installed apache2 and modsecurity.${RST}\n"
-	
-	elif [[ ${SERVER} == 2 ]];
-	then 
-		echo -e "${GRN}[*] Updating system & nginx${RST}"
-		sudo update > /dev/null 2>&1
-		sudo apt install nginx apache2-utils -y 2> /dev/null
-		echo -e "${GRN}[*] Installed nginx.${RST}\n"
-	
-	else
-		echo -e "${RED}[!] Enter a valid input.${RST}\n"
-		continue
-	fi
+pkg_update() {
+  case "$PKG_MGR" in
+    apt) apt-get update -y ;;
+    dnf) dnf -y makecache ;;
+    yum) yum -y makecache ;;
+    pacman) pacman -Sy --noconfirm ;;
+    *) err "Unsupported distro (no known package manager)."; exit 1 ;;
+  esac
+}
 
-	if [[ ${SERVER} == 1 ]];
-	then
-		echo -e "${YLO}[!] Taking backup of defautl apache2 conf file.(/etc/apache2/apache2.conf.backup)${RST}\n"
-		sudo cp /etc/apache2/apache2.conf /etc/apache2/apache2.conf.backup
-		echo -e "${GRN}[*] Installing new configuration files.${RST}"
-		sudo cp -i apache2/apache2.conf /etc/apache2/ && sudo cp -i apache2/000-default.conf /etc/apache2/sites-available/
-		
-		if [[ $? == 0 ]];
-		then
-			echo -e "${GRN}[*] Installed new configuration files successfully${RST}\n"
-		else
-			echo -e "${RED}[!] Unable to install new configuration.${RST}\n"
-		fi
+pkg_install() {
+  local pkgs=("$@")
+  case "$PKG_MGR" in
+    apt) apt-get install -y "${pkgs[@]}" ;;
+    dnf) dnf install -y "${pkgs[@]}" ;;
+    yum) yum install -y "${pkgs[@]}" ;;
+    pacman) pacman -S --noconfirm --needed "${pkgs[@]}" ;;
+    *) err "Unsupported distro (no known package manager)."; exit 1 ;;
+  esac
+}
 
-		echo -e "${GRN}[*] Installing modsecurity new rule set from owasp coreruleset.${RST}\n"
-		git clone https://github.com/coreruleset/coreruleset
+svc_enable_now() {
+  local svc=$1
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now "$svc"
+  else
+    warn "systemctl not found; please enable/start $svc manually."
+  fi
+}
 
-		echo -e "${YLO}[!] Taking backup of default modsecurity conf files.${RST}\n"
-		sudo mv /usr/share/modsecurity-crs /usr/share/modsecurity-crs-backup
+apache_service_name() {
+  # Debian uses apache2, RHEL/Fedora typically httpd
+  if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+    echo apache2
+  else
+    echo httpd
+  fi
+}
 
-		if [[ $? == 0 ]];
-		then
-			echo -e "${GRN}[*] Backup is successfully taken. (/usr/share/modsecurity-crs-backup)${RST}\n"
-		else
-			echo -e "${RED}[!] Unable to create backup.${RST}"
-		fi
+install_apache() {
+  log "Installing Apache + ModSecurity (best-effort across distros)"
 
-		suod rm -rf /usr/share/modsecurity-crs > /dev/null 2>&1
-		
-		echo -e "${GRN}[*] Installing new modsecurity rule set.\n"
-		mv coreruleset/crs-setup.conf.example coreruleset/crs-setup.conf 
-		sudo mv coreruleset /usr/share/modsecurity-crs && sudo cp apache2/modsecurity.conf /etc/modsecurity/
+  case "$DISTRO_FAMILY" in
+    debian)
+      pkg_update
+      pkg_install apache2 apache2-utils libapache2-mod-security2 git
+      ;;
+    fedora)
+      pkg_update
+      # Packages vary by distro version/repos
+      pkg_install httpd mod_security2 git || pkg_install httpd mod_security git
+      ;;
+    arch)
+      pkg_update
+      # Arch package names may differ; keep best-effort
+      pkg_install apache git || true
+      warn "On Arch, ModSecurity packages may require AUR (e.g., modsecurity / modsecurity-apache)."
+      ;;
+    *)
+      err "Unsupported distro family: $DISTRO_FAMILY"
+      exit 1
+      ;;
+  esac
 
-		if [[ $? == 0 ]];
-		then
-			echo -e "${GRN}[*] Installed new modsecurity rule set successfully.${RST}\n"
-		else
-			echo -e "${RED}[!] Unable to install new modsecurity rule set\n"
-			break
-		fi 
-	
-	elif [[ ${SERVER} == 2 ]];
-	then
-		sudo cp -i nginx/nginx.conf /etc/nginx/
+  # Install configs (Debian layout expected by repo). We copy them, but do not assume paths exist.
+  if [[ -d /etc/apache2 ]]; then
+    warn "Detected Debian-style Apache layout (/etc/apache2). Applying Debian config files."
+    [[ -f /etc/apache2/apache2.conf ]] && cp -a /etc/apache2/apache2.conf "/etc/apache2/apache2.conf.backup.$(date +%F_%H%M%S)" || true
+    cp -f apache2/apache2.conf /etc/apache2/
+    cp -f apache2/000-default.conf /etc/apache2/sites-available/
 
-		if [[ $? == 0 ]]
-		then
-			echo -e "${GRN}[*] Replaced nginx default configuration file with new configuration file.${RST}\n"
-			break
-		else
-			echo -e "${RED}[!] Unable to install new configuration.${RST}\n"
-			break
-		fi
-	fi
+    # OWASP hardening snippet (a2enconf-friendly)
+    if [[ -f apache2/conf-available/security-owasp.conf ]]; then
+      cp -f apache2/conf-available/security-owasp.conf /etc/apache2/conf-available/security-owasp.conf
+      if command -v a2enmod >/dev/null 2>&1; then a2enmod headers >/dev/null 2>&1 || true; fi
+      if command -v a2enconf >/dev/null 2>&1; then a2enconf security-owasp >/dev/null 2>&1 || true; fi
+    fi
+  else
+    warn "Non-Debian Apache layout detected. Skipping automatic config copy for Apache (paths differ)."
+    warn "You can still use repo configs as reference and apply them manually for your distro."
+  fi
 
-	echo -e -n "${YLO}[*] Have you installed any firewall(y/N): "
-	read FIREWALL
+  # OWASP CRS (Debian example). Only attempt when typical target dir exists.
+  if [[ -d /usr/share ]] && [[ -d /etc/modsecurity || -d /etc/modsecurity.d ]]; then
+    log "Fetching OWASP Core Rule Set (CRS)"
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' RETURN
 
-	if [[ ${FIREWALL} == y || ${FIREWALL} == Y ]];
-	then
-		echo -e "${YLO}[!] If you installed any firewall except fail2ban then please remove or disable it because it may overwrite firewall rules.\n"
-		echo -e -n "${GRN}[*] Disable/uninstall the firewall and type "y/Y" and enter: "
-		read ANS
+    git clone --depth 1 https://github.com/coreruleset/coreruleset "$tmpdir/coreruleset"
+    mv "$tmpdir/coreruleset/crs-setup.conf.example" "$tmpdir/coreruleset/crs-setup.conf"
 
-		if [[ ${ANS} == Y || ${ANS} == y ]];
-		then
-			FIREWALL_INSTALL
-			break
-		else
-			echo -e "${RED}[!] Not installed any firewall."
-			break
-		fi
-		
-	elif [[ ${FIREWALL} == n || ${FIREWALL} == N ]];
-	then
-		FIREWALL_INSTALL
-		break
-	fi
+    if [[ -d /usr/share/modsecurity-crs ]]; then
+      mv /usr/share/modsecurity-crs "/usr/share/modsecurity-crs-backup.$(date +%F_%H%M%S)" || true
+    fi
+    rm -rf /usr/share/modsecurity-crs
+    mv "$tmpdir/coreruleset" /usr/share/modsecurity-crs
 
-done
+    # Debian: /etc/modsecurity
+    if [[ -d /etc/modsecurity ]]; then
+      cp -f apache2/modsecurity.conf /etc/modsecurity/ || true
+    fi
+  else
+    warn "Skipping CRS auto-install (ModSecurity paths differ or not installed)."
+  fi
+
+  svc_enable_now "$(apache_service_name)"
+  log "Apache install step completed."
+}
+
+install_nginx() {
+  log "Installing Nginx"
+  case "$DISTRO_FAMILY" in
+    debian)
+      pkg_update
+      pkg_install nginx apache2-utils
+      ;;
+    fedora)
+      pkg_update
+      pkg_install nginx httpd-tools
+      ;;
+    arch)
+      pkg_update
+      pkg_install nginx
+      ;;
+    *)
+      err "Unsupported distro family: $DISTRO_FAMILY"
+      exit 1
+      ;;
+  esac
+
+  # Install nginx.conf if path exists (common across distros)
+  if [[ -d /etc/nginx ]]; then
+    [[ -f /etc/nginx/nginx.conf ]] && cp -a /etc/nginx/nginx.conf "/etc/nginx/nginx.conf.backup.$(date +%F_%H%M%S)" || true
+    cp -f nginx/nginx.conf /etc/nginx/nginx.conf || true
+
+    # OWASP snippet: Debian-style conf-available/conf-enabled
+    if [[ -d /etc/nginx/conf-available && -d /etc/nginx/conf-enabled && -f nginx/conf-available/security-owasp.conf ]]; then
+      cp -f nginx/conf-available/security-owasp.conf /etc/nginx/conf-available/security-owasp.conf
+      ln -sf /etc/nginx/conf-available/security-owasp.conf /etc/nginx/conf-enabled/security-owasp.conf
+    else
+      warn "Nginx conf-available/conf-enabled not found."
+      warn "If you want the snippet, include it manually from nginx.conf inside the http{} block."
+    fi
+  else
+    warn "/etc/nginx not found; skipping config copy."
+  fi
+
+  svc_enable_now nginx
+  log "Nginx install step completed."
+}
+
+install_fail2ban() {
+  log "Installing Fail2ban"
+  case "$DISTRO_FAMILY" in
+    debian)
+      pkg_update
+      pkg_install fail2ban iptables
+      ;;
+    fedora)
+      pkg_update
+      # Fedora/RHEL family may use firewalld/nftables; still install fail2ban.
+      pkg_install fail2ban
+      ;;
+    arch)
+      pkg_update
+      pkg_install fail2ban
+      ;;
+    *)
+      err "Unsupported distro family: $DISTRO_FAMILY"
+      exit 1
+      ;;
+  esac
+
+  if [[ -d /etc/fail2ban ]]; then
+    install -d /etc/fail2ban/jail.d
+    # Prefer jail.d drop-in baseline
+    if [[ -f fail2ban/jail.d/owasp-baseline.local ]]; then
+      install -m 0644 fail2ban/jail.d/owasp-baseline.local /etc/fail2ban/jail.d/owasp-baseline.local
+    else
+      # fallback to existing jail.local
+      install -m 0644 fail2ban/jail.local /etc/fail2ban/jail.local
+    fi
+  fi
+
+  svc_enable_now fail2ban
+  log "Fail2ban install step completed."
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    fail2ban-client status sshd || true
+  fi
+}
+
+main_menu() {
+  while true; do
+    warn "Caution: do not run blindly on production systems. Review changes first."
+    echo -e "${GRN}[*] 1) Install Apache (and best-effort ModSecurity/CRS)"
+    echo -e "[*] 2) Install Nginx"
+    echo -e "[*] 3) Install Fail2ban"
+    echo -e "[*] 4) Install All (Apache + Nginx + Fail2ban)"
+    echo -e "[*] 5) Exit${RST}"
+    echo -en "${CYN}Select an option: ${RST}"
+    read -r choice
+
+    case "$choice" in
+      1) install_apache ;;
+      2) install_nginx ;;
+      3) install_fail2ban ;;
+      4) install_apache; install_nginx; install_fail2ban ;;
+      5) exit 0 ;;
+      *) err "Invalid option" ;;
+    esac
+
+    echo
+  done
+}
+
+need_root
+detect_distro
+log "Detected distro family: ${DISTRO_FAMILY} (ID=${OS_ID})"
+main_menu
